@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typing as t
+from typing import cast
 
 from sqlglot import exp, parser, tokens
 from sqlglot.dialects.dialect import Dialect
@@ -61,6 +62,7 @@ class PRQL(Dialect):
             "AGGREGATE": lambda self, query: self._parse_selection(
                 query, parse_method=self._parse_aggregate, append=False
             ),
+            "JOIN": lambda self, query: self._parse_join_prql(query),
         }
 
         FUNCTIONS = {
@@ -201,3 +203,108 @@ class PRQL(Dialect):
             return self.expression(
                 exp.From, comments=self._prev_comments, this=self._parse_table(joins=joins)
             )
+
+        def _parse_join_prql(self, query: exp.Select) -> exp.Select:
+            join_type = "INNER"
+
+            side = self._get_join_type()
+            if side:
+                join_type = side
+
+            alias, table_name = self._parse_table_and_alias()
+
+            table = self.expression(
+                exp.Table,
+                this=exp.to_identifier(table_name),
+                alias=exp.to_identifier(alias) if alias else None,
+            )
+
+            join_condition = self._parse_join_condition(query, alias, table)
+
+            if join_condition:
+                from_expr = cast(exp.From, query.args.get("from"))
+                left_table = cast(exp.Expression, from_expr.args["this"]).alias_or_name
+                right_table = alias or table.alias_or_name
+                join_condition = self._replace_this_that(join_condition, left_table, right_table)
+
+            join = exp.Join(this=table, kind=join_type, on=join_condition)
+            query = query.join(join)
+            return query
+
+        def _parse_table_and_alias(self) -> t.Tuple[str | None, str]:
+            table_name = cast(str, self._parse_id_var())
+            alias = None
+
+            if self._match(TokenType.ALIAS):
+                alias = table_name
+                table_name = cast(str, self._parse_id_var())
+
+            return alias, table_name
+
+        def _get_join_type(self) -> t.Optional[str]:
+            if self._match_texts({"SIDE"}):
+                if self._match(TokenType.COLON):
+                    if self._match(TokenType.LEFT):
+                        return "LEFT"
+                    elif self._match(TokenType.RIGHT):
+                        return "RIGHT"
+                    elif self._match(TokenType.FULL):
+                        return "FULL"
+                    elif self._match(TokenType.INNER):
+                        return "INNER"
+                    else:
+                        self.raise_error(
+                            "Unsupported join side. Expected LEFT, RIGHT, FULL, or INNER."
+                        )
+            return None
+
+        def _parse_join_condition(
+            self, query: exp.Select, alias: str | None, table: exp.Table
+        ) -> t.Optional[exp.Expression]:
+            join_condition: t.Optional[exp.Expression] = None
+
+            if self._match(TokenType.TRUE):
+                join_condition = self.expression(exp.Boolean, this=True)
+
+            elif self._match(TokenType.L_PAREN):
+                if self._match(TokenType.EQ):
+                    column_name = cast(str, self._parse_id_var())
+                    if column_name:
+                        from_expr = cast(exp.From, query.args.get("from"))
+                        left_table = cast(exp.Expression, from_expr.args["this"]).alias_or_name
+                        right_table = alias or table.alias_or_name
+                        join_condition = self.expression(
+                            exp.EQ,
+                            this=exp.Column(
+                                this=exp.to_identifier(column_name),
+                                table=exp.to_identifier(left_table),
+                            ),
+                            expression=exp.Column(
+                                this=exp.to_identifier(column_name),
+                                table=exp.to_identifier(right_table),
+                            ),
+                        )
+                else:
+                    join_condition = self._parse_conjunction()
+
+                if not self._match(TokenType.R_PAREN):
+                    self.raise_error("Expected ')' at the end of join condition")
+
+            return join_condition
+
+        def _replace_this_that(
+            self, condition: exp.Expression, left_table: str, right_table: str
+        ) -> exp.Expression:
+            replacement_map = {
+                "this": left_table,
+                "that": right_table,
+            }
+
+            def transform(expression: exp.Expression) -> exp.Expression:
+                if isinstance(expression, exp.Column) and expression.table:
+                    lower_table = expression.table.lower()
+                    if lower_table in replacement_map:
+                        expression.set("table", replacement_map[lower_table])
+                return expression
+
+            return condition.transform(transform)
